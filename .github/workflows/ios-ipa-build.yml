@@ -1,0 +1,52 @@
+name: ios-ipa-build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install wget
+        run: brew install wget
+
+      - name: Build sherpa-onnx xcframework
+        run: |
+          chmod +x build-ios-no-tts.sh
+          ./build-ios-no-tts.sh
+
+      - name: Copy frameworks to expected paths
+        run: |
+          rm -rf build-ios
+          mkdir -p build-ios/ios-onnxruntime
+          cp -R build-ios-no-tts/sherpa-onnx.xcframework build-ios/
+          cp -R build-ios-no-tts/ios-onnxruntime/onnxruntime.xcframework build-ios/ios-onnxruntime/
+
+      - name: Build iOS app
+        run: |
+          xcodebuild \
+            -project ios-swiftui/SherpaOnnx/SherpaOnnx.xcodeproj \
+            -scheme SherpaOnnx \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/derived \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package IPA
+        run: |
+          APP_PATH="build/derived/Build/Products/Release-iphoneos/SherpaOnnx.app"
+          rm -rf Payload HearingSubtitle.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload HearingSubtitle.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HearingSubtitle-ipa
+          path: HearingSubtitle.ipa

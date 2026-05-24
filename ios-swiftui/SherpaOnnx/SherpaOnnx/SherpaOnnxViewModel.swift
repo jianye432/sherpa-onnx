@@ -8,121 +8,193 @@
 import AVFoundation
 import Foundation
 
-enum Status {
-    case stop
+enum RecordingState: Equatable {
+    case idle
+    case preparing
     case recording
+    case stopped
+    case failed
+}
+
+enum SubtitleError: LocalizedError {
+    case microphoneDenied
+    case missingRecognizer
+    case missingAudioEngine
+
+    var errorDescription: String? {
+        switch self {
+        case .microphoneDenied:
+            return "麦克风权限未开启"
+        case .missingRecognizer:
+            return "识别器未准备好"
+        case .missingAudioEngine:
+            return "音频引擎未准备好"
+        }
+    }
 }
 
 @MainActor
-class SherpaOnnxViewModel: ObservableObject {
-    @Published var status: Status = .stop
-    @Published var subtitles: String = ""
+final class SherpaOnnxViewModel: ObservableObject {
+    @Published var state: RecordingState = .idle
+    @Published var subtitleText: String = ""
+    @Published var statusMessage: String = "点击开始，实时收音识别"
+    @Published var errorMessage: String = ""
 
-    var sentences: [String] = []
+    private let audioSession = AVAudioSession.sharedInstance()
+    private var audioEngine: AVAudioEngine?
+    private var recognizer: SherpaOnnxRecognizer?
 
-    var audioEngine: AVAudioEngine? = nil
-    var recognizer: SherpaOnnxRecognizer! = nil
-    private var audioSession: AVAudioSession!
+    private var finalLines: [String] = []
+    private let maxFinalLines = 40
 
-    var lastSentence: String = ""
-    let maxSentence: Int = 20
-
-    var results: String {
-        if sentences.isEmpty && lastSentence.isEmpty {
-            return ""
+    var allText: String {
+        var lines = finalLines
+        if !subtitleText.isEmpty {
+            lines.append(subtitleText)
         }
-        if sentences.isEmpty {
-            return "0: \(lastSentence.lowercased())"
-        }
+        return lines.joined(separator: "\n")
+    }
 
-        let start = max(sentences.count - maxSentence, 0)
-        if lastSentence.isEmpty {
-            return sentences.enumerated().map { (index, s) in
-                "\(index): \(s.lowercased())"
-            }[start...]
-            .joined(separator: "\n")
+    var isRunning: Bool {
+        state == .recording
+    }
+
+    func toggleRecorder() async {
+        if isRunning {
+            stopRecorder()
         } else {
-            return sentences.enumerated().map { (index, s) in
-                "\(index): \(s.lowercased())"
-            }[start...]
-            .joined(separator: "\n")
-                + "\n\(sentences.count): \(lastSentence.lowercased())"
+            await startRecorder()
         }
     }
 
-    func updateLabel() {
-        self.subtitles = self.results
+    func clearTranscript() {
+        finalLines.removeAll()
+        subtitleText = ""
     }
 
-    func setupAudioSession() {
-        audioSession = AVAudioSession.sharedInstance()
+    func stopRecorder() {
+        audioEngine?.stop()
+        audioEngine = nil
+        recognizer?.reset()
         do {
-            try audioSession.setCategory(
-                .playAndRecord, mode: .default, options: [.defaultToSpeaker])
-            try audioSession.setActive(true)
+            try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
         } catch {
-            print("Failed to set up audio session: \(error)")
+            print("Failed to deactivate audio session: \(error.localizedDescription)")
+        }
+        subtitleText = ""
+        statusMessage = "已停止"
+        state = .stopped
+    }
+
+    private func startRecorder() async {
+        state = .preparing
+        errorMessage = ""
+        statusMessage = "正在准备模型"
+
+        do {
+            let granted = await requestMicrophonePermission()
+            guard granted else {
+                throw SubtitleError.microphoneDenied
+            }
+
+            try configureAudioSession()
+
+            let modelRoot = try await ChineseParaformerModelStore.shared.ensureDownloaded { [weak self] message in
+                self?.statusMessage = message
+            }
+
+            if recognizer == nil {
+                recognizer = try makeRecognizer(modelRoot: modelRoot)
+            }
+
+            guard let recognizer else {
+                throw SubtitleError.missingRecognizer
+            }
+
+            try configureAudioEngine(recognizer: recognizer)
+
+            clearTranscript()
+            statusMessage = "正在收音"
+            try audioSession.setActive(true)
+            audioEngine?.prepare()
+            try audioEngine?.start()
+            state = .recording
+        } catch {
+            stopRecorder()
+            state = .failed
+            statusMessage = "启动失败"
+            errorMessage = error.localizedDescription
         }
     }
 
-    init() {
-        initRecognizer()
-        setupAudioSession()
-        initRecorder()
+    private func requestMicrophonePermission() async -> Bool {
+        await withCheckedContinuation { continuation in
+            audioSession.requestRecordPermission { granted in
+                continuation.resume(returning: granted)
+            }
+        }
     }
 
-    private func initRecognizer() {
-        // Please select one model that is best suitable for you.
-        //
-        // You can also modify Model.swift to add new pre-trained models from
-        // https://k2-fsa.github.io/sherpa/onnx/pretrained_models/index.html
-        // let modelConfig = getBilingualStreamZhEnZipformer20230220()
-        let modelConfig = getBilingualStreamingZhEnParaformer()
+    private func configureAudioSession() throws {
+        try audioSession.setCategory(.record, mode: .measurement, options: [])
+        try audioSession.setPreferredSampleRate(16_000)
+        try audioSession.setPreferredIOBufferDuration(0.02)
+    }
 
+    private func makeRecognizer(modelRoot: URL) throws -> SherpaOnnxRecognizer {
+        let modelConfig = makeChineseStreamingParaformerModelConfig(modelRoot: modelRoot)
         let featConfig = sherpaOnnxFeatureConfig(
-            sampleRate: 16000,
-            featureDim: 80)
+            sampleRate: 16_000,
+            featureDim: 80
+        )
 
         var config = sherpaOnnxOnlineRecognizerConfig(
             featConfig: featConfig,
             modelConfig: modelConfig,
             enableEndpoint: true,
-            rule1MinTrailingSilence: 2.4,
+            rule1MinTrailingSilence: 1.2,
             rule2MinTrailingSilence: 0.8,
-            rule3MinUtteranceLength: 30,
+            rule3MinUtteranceLength: 20,
             decodingMethod: "greedy_search",
             maxActivePaths: 4
         )
-        recognizer = SherpaOnnxRecognizer(config: &config)
+
+        return SherpaOnnxRecognizer(config: &config)
     }
 
-    private func initRecorder() {
-        print("init recorder")
-        audioEngine = AVAudioEngine()
-        let inputNode = self.audioEngine?.inputNode
-        let bus = 0
-        let inputFormat = inputNode?.outputFormat(forBus: bus)
-        let outputFormat = AVAudioFormat(
+    private func configureAudioEngine(recognizer: SherpaOnnxRecognizer) throws {
+        audioEngine?.stop()
+        audioEngine = nil
+
+        let engine = AVAudioEngine()
+        let inputNode = engine.inputNode
+        let inputBus = 0
+        let inputFormat = inputNode.outputFormat(forBus: inputBus)
+
+        guard let outputFormat = AVAudioFormat(
             commonFormat: .pcmFormatFloat32,
-            sampleRate: 16000, channels: 1,
-            interleaved: false)!
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw SubtitleError.missingAudioEngine
+        }
 
-        let converter = AVAudioConverter(from: inputFormat!, to: outputFormat)!
+        guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
+            throw SubtitleError.missingAudioEngine
+        }
 
-        inputNode!.installTap(
-            onBus: bus,
-            bufferSize: 1024,
+        inputNode.installTap(
+            onBus: inputBus,
+            bufferSize: 512,
             format: inputFormat
-        ) {
-            (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
+        ) { buffer, _ in
             var newBufferAvailable = true
 
-            let inputCallback: AVAudioConverterInputBlock = {
-                inNumPackets, outStatus in
+            let inputCallback: AVAudioConverterInputBlock = { _, outStatus in
                 if newBufferAvailable {
                     outStatus.pointee = .haveData
                     newBufferAvailable = false
-
                     return buffer
                 } else {
                     outStatus.pointee = .noDataNow
@@ -130,72 +202,63 @@ class SherpaOnnxViewModel: ObservableObject {
                 }
             }
 
-            let convertedBuffer = AVAudioPCMBuffer(
+            let frameCapacity = AVAudioFrameCount(outputFormat.sampleRate)
+                * buffer.frameLength
+                / AVAudioFrameCount(buffer.format.sampleRate) + 1
+
+            guard let convertedBuffer = AVAudioPCMBuffer(
                 pcmFormat: outputFormat,
-                frameCapacity:
-                    AVAudioFrameCount(outputFormat.sampleRate)
-                    * buffer.frameLength
-                    / AVAudioFrameCount(buffer.format.sampleRate))!
+                frameCapacity: frameCapacity
+            ) else {
+                return
+            }
 
-            var error: NSError?
-            let _ = converter.convert(
+            var conversionError: NSError?
+            let status = converter.convert(
                 to: convertedBuffer,
-                error: &error, withInputFrom: inputCallback)
+                error: &conversionError,
+                withInputFrom: inputCallback
+            )
 
-            // TODO(fangjun): Handle status != haveData
+            guard status != .error, conversionError == nil else {
+                return
+            }
 
-            let array = convertedBuffer.array()
-            if !array.isEmpty {
-                self.recognizer.acceptWaveform(samples: array)
-                while self.recognizer.isReady() {
-                    self.recognizer.decode()
-                }
-                let isEndpoint = self.recognizer.isEndpoint()
-                let text = self.recognizer.getResult().text
+            let samples = convertedBuffer.array()
+            guard !samples.isEmpty else {
+                return
+            }
 
-                if !text.isEmpty && self.lastSentence != text {
-                    self.lastSentence = text
-                    self.updateLabel()
-                    print(text)
-                }
+            recognizer.acceptWaveform(samples: samples)
+            while recognizer.isReady() {
+                recognizer.decode()
+            }
 
-                if isEndpoint {
-                    if !text.isEmpty {
-                        let tmp = self.lastSentence
-                        self.lastSentence = ""
-                        self.sentences.append(tmp)
-                    }
-                    self.recognizer.reset()
+            let result = recognizer.getResult().text.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            let endpoint = recognizer.isEndpoint()
+
+            if !result.isEmpty {
+                DispatchQueue.main.async {
+                    self.subtitleText = result
                 }
             }
+
+            if endpoint {
+                if !result.isEmpty {
+                    DispatchQueue.main.async {
+                        self.finalLines.append(result)
+                        if self.finalLines.count > self.maxFinalLines {
+                            self.finalLines.removeFirst(self.finalLines.count - self.maxFinalLines)
+                        }
+                        self.subtitleText = ""
+                    }
+                }
+                recognizer.reset()
+            }
         }
-    }
 
-    public func toggleRecorder() {
-        if status == .stop {
-            startRecorder()
-            status = .recording
-        } else {
-            stopRecorder()
-            status = .stop
-        }
-    }
-
-    private func startRecorder() {
-        lastSentence = ""
-        sentences = []
-
-        do {
-            try self.audioEngine?.start()
-        } catch let error as NSError {
-            print(
-                "Got an error starting audioEngine: \(error.domain), \(error)")
-        }
-        print("started")
-    }
-
-    private func stopRecorder() {
-        audioEngine?.stop()
-        print("stopped")
+        audioEngine = engine
     }
 }
