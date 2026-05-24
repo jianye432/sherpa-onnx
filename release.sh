@@ -36,7 +36,8 @@ mkdir -p $dst/build-ios/
 cp -av ./build-ios/sherpa-onnx.xcframework $dst/build-ios/
 
 mkdir -p $dst/build-ios/ios-onnxruntime
-cp -av ./build-ios/ios-onnxruntime/onnxruntime.xcframework $dst/build-ios/ios-onnxruntime/
+cp -av ./build-ios/ios-onnxruntime/1.17.1 $dst/build-ios/ios-onnxruntime/
+ln -sfn 1.17.1/onnxruntime.xcframework $dst/build-ios/ios-onnxruntime/onnxruntime.xcframework
 
 cd $dst
 

@@ -23,7 +23,8 @@ jobs:
           rm -rf build-ios
           mkdir -p build-ios/ios-onnxruntime
           cp -R build-ios-no-tts/sherpa-onnx.xcframework build-ios/
-          cp -R build-ios-no-tts/ios-onnxruntime/onnxruntime.xcframework build-ios/ios-onnxruntime/
+          cp -R build-ios-no-tts/ios-onnxruntime/1.17.1 build-ios/ios-onnxruntime/
+          ln -sfn 1.17.1/onnxruntime.xcframework build-ios/ios-onnxruntime/onnxruntime.xcframework
 
       - name: Build iOS app
         run: |
